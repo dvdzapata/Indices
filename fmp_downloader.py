@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import quote_plus
+from urllib.parse import quote, quote_plus
 
 import requests
 from sqlalchemy import MetaData, Table, create_engine, func, select
@@ -74,6 +74,11 @@ ASSET_SYMBOLS: Tuple[Tuple[int, str], ...] = (
     (126, "SX8P.Z"),
     (140, "DX-Y.NYB"),
 )
+
+
+def encode_symbol(symbol: str) -> str:
+    """Encode symbols for URL path segments (e.g. ^SPX -> %5ESPX)."""
+    return quote(symbol, safe="")
 
 
 @dataclass
@@ -428,7 +433,7 @@ def fetch_daily_data(
     cache_key = f"{symbol}:{start.date().isoformat()}:{end.date().isoformat()}"
     if cache_key in cache:
         return cache[cache_key]
-    url = DAILY_ENDPOINT.format(symbol=symbol)
+    url = DAILY_ENDPOINT.format(symbol=encode_symbol(symbol))
     params = {
         "apikey": session.params.get("apikey"),
         "from": start.date().isoformat(),
@@ -461,7 +466,7 @@ def fetch_intraday_data(
     cache_key = f"{symbol}:{start.isoformat()}:{end.isoformat()}"
     if cache_key in interval_cache:
         return interval_cache[cache_key]
-    url = INTRADAY_ENDPOINT.format(interval=interval, symbol=symbol)
+    url = INTRADAY_ENDPOINT.format(interval=interval, symbol=encode_symbol(symbol))
     params = {
         "apikey": session.params.get("apikey"),
         "from": start.strftime("%Y-%m-%d %H:%M:%S"),
