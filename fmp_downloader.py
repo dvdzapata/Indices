@@ -233,7 +233,8 @@ def setup_logging() -> None:
 def parse_datetime(value: str) -> Optional[datetime]:
     if not value:
         return None
-    value = value.replace("Z", "+") if value.endswith("Z") else value
+    if value.endswith("Z"):
+        value = value.replace("Z", "+00:00")
     try:
         dt = datetime.fromisoformat(value)
     except ValueError:
