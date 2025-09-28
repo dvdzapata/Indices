@@ -469,6 +469,53 @@ def validate_price_rows(
 ) -> None:
     if not rows:
         return
+    original_len = len(rows)
+    violations = {
+        "high_lt_oc": 0,
+        "low_gt_oc": 0,
+        "high_lt_low": 0,
+        "volume_negative": 0,
+    }
+    valid_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        open_ = row.get("open")
+        high = row.get("high")
+        low = row.get("low")
+        close = row.get("close")
+        volume = row.get("volume")
+        oc_values = [v for v in (open_, close) if isinstance(v, (int, float))]
+        oc_max = max(oc_values) if oc_values else None
+        oc_min = min(oc_values) if oc_values else None
+        has_violation = False
+        if isinstance(high, (int, float)) and oc_max is not None and high < oc_max:
+            violations["high_lt_oc"] += 1
+            has_violation = True
+        if isinstance(low, (int, float)) and oc_min is not None and low > oc_min:
+            violations["low_gt_oc"] += 1
+            has_violation = True
+        if isinstance(high, (int, float)) and isinstance(low, (int, float)) and high < low:
+            violations["high_lt_low"] += 1
+            has_violation = True
+        if isinstance(volume, (int, float)) and volume < 0:
+            violations["volume_negative"] += 1
+            has_violation = True
+        if not has_violation:
+            valid_rows.append(row)
+    if len(valid_rows) != original_len:
+        logger.warning(
+            "Discarded %s/%s rows for asset_id=%s interval=%s due to quality violations "
+            "(high>=max(open,close) failures=%s, low<=min(open,close) failures=%s, "
+            "high>=low failures=%s, volume>=0 failures=%s)",
+            original_len - len(valid_rows),
+            original_len,
+            asset_id,
+            interval,
+            violations["high_lt_oc"],
+            violations["low_gt_oc"],
+            violations["high_lt_low"],
+            violations["volume_negative"],
+        )
+        rows[:] = valid_rows
     zero_volume = sum(1 for row in rows if not row.get("volume"))
     if zero_volume == len(rows):
         logger.warning(
