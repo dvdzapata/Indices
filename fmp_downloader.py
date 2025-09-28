@@ -29,6 +29,7 @@ INTRADAY_ENDPOINT = BASE_URL + "/historical-chart/{interval}"
 
 START_DATE = datetime(2019, 1, 1, tzinfo=timezone.utc)
 PROGRESS_FILE = Path("fmp_progress.json")
+INTRADAY_EXCLUSION_FILE = Path("fmp_intraday_exclusions.json")
 LOG_DIR = Path("logs")
 LOG_FILE = LOG_DIR / "fmp_downloader.log"
 REQUEST_TIMEOUT = 30
@@ -175,6 +176,53 @@ class ProgressTracker:
             return
         self._dirty = False
         self._pending_writes = 0
+
+
+class IntradayExclusionRegistry:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.state: Dict[str, List[str]] = {}
+        self._dirty = False
+        if path.exists():
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    self.state = {
+                        str(asset_id): sorted({str(interval) for interval in intervals})
+                        for asset_id, intervals in loaded.items()
+                        if isinstance(intervals, list)
+                    }
+            except (json.JSONDecodeError, OSError):
+                self.state = {}
+
+    def is_excluded(self, asset_id: int, interval: str) -> bool:
+        return interval in self.state.get(str(asset_id), [])
+
+    def exclude(self, asset_id: int, interval: str) -> None:
+        asset_key = str(asset_id)
+        intervals = set(self.state.get(asset_key, []))
+        if interval not in intervals:
+            intervals.add(interval)
+            self.state[asset_key] = sorted(intervals)
+            self._dirty = True
+            self.flush()
+
+    def flush(self, force: bool = False) -> None:
+        if not (self._dirty or force):
+            return
+        try:
+            if not self.path.parent.exists():
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+            tmp_path.write_text(
+                json.dumps(self.state, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            tmp_path.replace(self.path)
+            self._dirty = False
+        except OSError:
+            # Leave dirty flag set so we retry on next flush.
+            return
 
 
 def load_env(path: Path) -> Dict[str, str]:
@@ -592,6 +640,51 @@ def validate_price_rows(
         )
 
     return original_len - len(rows)
+
+
+def detect_synthetic_intraday_series(
+    rows: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    total = len(rows)
+    if total == 0:
+        return None
+    flat_candles = 0
+    zero_volume = 0
+    time_values = set()
+    for row in rows:
+        open_ = row.get("open")
+        high = row.get("high")
+        low = row.get("low")
+        close = row.get("close")
+        if (
+            open_ is not None
+            and high is not None
+            and low is not None
+            and close is not None
+            and open_ == high == low == close
+        ):
+            flat_candles += 1
+        volume = row.get("volume")
+        if volume is None or volume == 0:
+            zero_volume += 1
+        fecha = row.get("fecha")
+        if isinstance(fecha, datetime):
+            time_values.add(fecha.astimezone(NEW_YORK_TZ).time())
+    if not time_values:
+        return None
+    flat_ratio = flat_candles / total
+    zero_volume_ratio = zero_volume / total
+    repeated_time = len(time_values) == 1
+    if flat_ratio >= 0.9 and (zero_volume_ratio >= 0.9 or zero_volume == total) and repeated_time:
+        return {
+            "flat_ratio": flat_ratio,
+            "zero_volume_ratio": zero_volume_ratio,
+            "flat_candles": flat_candles,
+            "zero_volume": zero_volume,
+            "total": total,
+            "time_of_day": next(iter(time_values)).isoformat(),
+        }
+    return None
 
 def build_daily_rows(
     symbol: str,
@@ -1067,6 +1160,7 @@ def process_intraday(
     engine,
     table: Table,
     progress: ProgressTracker,
+    exclusions: IntradayExclusionRegistry,
     logger: logging.Logger,
 ) -> SymbolStats:
     last_progress = progress.get(asset_id, interval)
@@ -1090,6 +1184,33 @@ def process_intraday(
     filtered_out = len(payload) - len(new_payload)
     discarded_by_validation = validate_price_rows(new_payload, logger, asset_id, interval)
     total_discarded = dedup_discarded + filtered_out + discarded_by_validation
+    synthetic_metrics = detect_synthetic_intraday_series(new_payload)
+    if synthetic_metrics:
+        logger.warning(
+            (
+                "Intraday payload flagged as synthetic for asset_id=%s interval=%s: "
+                "flat_candles=%s/%s (%.1f%%), zero_volume=%s/%s (%.1f%%), "
+                "repeated_time_of_day=%s; excluding series permanently"
+            ),
+            asset_id,
+            interval,
+            synthetic_metrics["flat_candles"],
+            synthetic_metrics["total"],
+            synthetic_metrics["flat_ratio"] * 100,
+            synthetic_metrics["zero_volume"],
+            synthetic_metrics["total"],
+            synthetic_metrics["zero_volume_ratio"] * 100,
+            synthetic_metrics["time_of_day"],
+        )
+        exclusions.exclude(asset_id, interval)
+        if new_payload:
+            progress.update(asset_id, interval, new_payload[-1]["fecha"])
+        return SymbolStats(
+            received=received,
+            inserted=0,
+            discarded=received,
+            gaps=gap_count,
+        )
     if not new_payload:
         logger.info("No new %s data needed for asset_id=%s", interval, asset_id)
         if payload:
@@ -1147,6 +1268,7 @@ def main() -> None:
     ensure_unique_indexes(engine, logger)
 
     progress = ProgressTracker(PROGRESS_FILE)
+    intraday_exclusions = IntradayExclusionRegistry(INTRADAY_EXCLUSION_FILE)
     rate_limiter = RateLimiter(RATE_LIMIT_PER_MINUTE, 60)
     session = requests.Session()
     session.params = {"apikey": config.fmp_api_key}
@@ -1172,6 +1294,13 @@ def main() -> None:
             )
             symbol_stats.accumulate(daily_stats)
             for interval in INTRADAY_INTERVALS:
+                if intraday_exclusions.is_excluded(asset_id, interval):
+                    logger.warning(
+                        "Skipping asset_id=%s interval=%s due to previously flagged synthetic intraday data",
+                        asset_id,
+                        interval,
+                    )
+                    continue
                 ensure_intraday_tables(engine, intraday_table, asset_id, interval, logger)
                 intraday_stats = process_intraday(
                     symbol,
@@ -1183,6 +1312,7 @@ def main() -> None:
                     engine,
                     intraday_table,
                     progress,
+                    intraday_exclusions,
                     logger,
                 )
                 symbol_stats.accumulate(intraday_stats)
@@ -1202,6 +1332,7 @@ def main() -> None:
 
     logger.info("Data synchronization completed")
     progress.flush(force=True)
+    intraday_exclusions.flush(force=True)
 
 
 if __name__ == "__main__":
