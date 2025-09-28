@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import quote, quote_plus
+from urllib.parse import quote_plus
 
 import requests
 from sqlalchemy import MetaData, Table, create_engine, func, select
@@ -21,7 +21,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 BASE_URL = "https://financialmodelingprep.com/stable"
 DAILY_ENDPOINT = BASE_URL + "/historical-price-eod/full"
-INTRADAY_ENDPOINT = BASE_URL + "/historical-chart/{interval}/{symbol}"
+INTRADAY_ENDPOINT = BASE_URL + "/historical-chart/{interval}"
 
 START_DATE = datetime(2019, 1, 1, tzinfo=timezone.utc)
 PROGRESS_FILE = Path("fmp_progress.json")
@@ -74,13 +74,6 @@ ASSET_SYMBOLS: Tuple[Tuple[int, str], ...] = (
     (126, "SX8P.Z"),
     (140, "DX-Y.NYB"),
 )
-
-
-def encode_symbol(symbol: str) -> str:
-    """Encode symbols for URL path segments (e.g. ^SPX -> %5ESPX)."""
-    return quote(symbol, safe="")
-
-
 @dataclass
 class Config:
     fmp_api_key: str
@@ -467,9 +460,10 @@ def fetch_intraday_data(
     cache_key = f"{symbol}:{start.isoformat()}:{end.isoformat()}"
     if cache_key in interval_cache:
         return interval_cache[cache_key]
-    url = INTRADAY_ENDPOINT.format(interval=interval, symbol=encode_symbol(symbol))
+    url = INTRADAY_ENDPOINT.format(interval=interval)
     params = {
         "apikey": session.params.get("apikey"),
+        "symbol": symbol,
         "from": start.strftime("%Y-%m-%d %H:%M:%S"),
         "to": end.strftime("%Y-%m-%d %H:%M:%S"),
     }
