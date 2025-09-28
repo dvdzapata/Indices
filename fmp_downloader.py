@@ -330,7 +330,9 @@ def detect_temporal_gaps(
             continue
         if previous is not None:
             delta = (current - previous).total_seconds()
-            if delta > tolerated:
+            if delta > tolerated and not is_expected_market_closure(
+                previous, current, interval, expected_seconds
+            ):
                 logger.warning(
                     "Gap detected for asset_id=%s interval=%s between %s and %s (%.0f seconds)",
                     asset_id,
@@ -340,6 +342,43 @@ def detect_temporal_gaps(
                     delta,
                 )
         previous = current
+
+
+def is_expected_market_closure(
+    previous: datetime,
+    current: datetime,
+    interval: str,
+    expected_seconds: float,
+) -> bool:
+    """Return True when the gap matches regular overnight/weekend pauses."""
+
+    if interval not in INTRADAY_SECONDS:
+        return False
+
+    # Anything within the default tolerance is already considered fine.
+    delta_seconds = (current - previous).total_seconds()
+    if delta_seconds <= expected_seconds * 3:
+        return True
+
+    prev_date = previous.date()
+    curr_date = current.date()
+    if curr_date <= prev_date:
+        return False
+
+    day_diff = (curr_date - prev_date).days
+    if day_diff == 1:
+        # Overnight closure between trading sessions.
+        return True
+
+    # Allow sequences where the days in-between are only weekend dates.
+    probe = prev_date + timedelta(days=1)
+    while probe < curr_date:
+        if probe.weekday() < 5:
+            return False
+        probe += timedelta(days=1)
+
+    # If we reach here, the gap spans only non-trading weekend days.
+    return True
 
 
 def build_daily_rows(symbol: str, asset_id: int, payload: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
