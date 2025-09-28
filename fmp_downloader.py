@@ -42,6 +42,39 @@ DAILY_SECONDS = 86400
 RATE_LIMIT_PER_MINUTE = 2900  # stay below 3000 requests/minute
 BATCH_SIZE = 500
 
+SYNTHETIC_ASSET_IDS = {
+    88,
+    95,
+    96,
+    97,
+    98,
+    99,
+    100,
+    101,
+    102,
+    103,
+    104,
+    105,
+    106,
+    107,
+    108,
+    113,
+    114,
+    115,
+    116,
+    117,
+    118,
+    119,
+    120,
+    121,
+    122,
+    123,
+    124,
+    125,
+    126,
+    140,
+}
+
 ASSET_SYMBOLS: Tuple[Tuple[int, str], ...] = (
     (88, "^MOVE"),
     (95, "^SPX"),
@@ -225,9 +258,39 @@ def safe_int(value: Any) -> Optional[int]:
     if value is None or (isinstance(value, str) and not value.strip()):
         return None
     try:
-        return int(float(value))
+        result = int(float(value))
+        return result
     except (TypeError, ValueError):
         return None
+
+
+def normalize_volume(value: Optional[int]) -> Optional[int]:
+    if value is None:
+        return None
+    if value <= 0:
+        return None
+    return value
+
+
+def ensure_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def compute_fallback_vwap(open_: Optional[float], high: Optional[float], low: Optional[float], close: Optional[float], raw_vwap: Optional[float]) -> Optional[float]:
+    if raw_vwap is not None:
+        return raw_vwap
+    prices = [price for price in (high, low, close) if price is not None]
+    if len(prices) == 3:
+        return sum(prices) / 3.0
+    if close is not None:
+        return close
+    if open_ is not None:
+        return open_
+    if prices:
+        return prices[0]
+    return None
 
 
 def request_json(session: requests.Session, url: str, params: Dict[str, Any], rate_limiter: RateLimiter, logger: logging.Logger) -> Any:
@@ -274,17 +337,24 @@ def normalize_daily_payload(raw: Any) -> List[Dict[str, Any]]:
         dt = parse_datetime(str(item.get("date")))
         if not dt or dt < START_DATE:
             continue
+        dt = ensure_utc(dt)
+        open_ = safe_float(item.get("open"))
+        high = safe_float(item.get("high"))
+        low = safe_float(item.get("low"))
+        close = safe_float(item.get("close"))
+        volume = normalize_volume(safe_int(item.get("volume")))
+        vwap = compute_fallback_vwap(open_, high, low, close, safe_float(item.get("vwap")))
         normalized.append(
             {
                 "fecha": dt,
-                "open": safe_float(item.get("open")),
-                "high": safe_float(item.get("high")),
-                "low": safe_float(item.get("low")),
-                "close": safe_float(item.get("close")),
-                "volume": safe_int(item.get("volume")),
+                "open": open_,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": volume,
                 "change": safe_float(item.get("change")),
                 "change_percent": safe_float(item.get("changePercent")),
-                "vwap": safe_float(item.get("vwap")),
+                "vwap": vwap,
             }
         )
     normalized.sort(key=lambda row: row["fecha"])
@@ -301,6 +371,7 @@ def normalize_intraday_payload(raw: Any) -> List[Dict[str, Any]]:
         dt = parse_datetime(str(item.get("date")))
         if not dt or dt < START_DATE:
             continue
+        dt = ensure_utc(dt)
         normalized.append(
             {
                 "fecha": dt,
@@ -308,7 +379,7 @@ def normalize_intraday_payload(raw: Any) -> List[Dict[str, Any]]:
                 "high": safe_float(item.get("high")),
                 "low": safe_float(item.get("low")),
                 "close": safe_float(item.get("close")),
-                "volume": safe_int(item.get("volume")),
+                "volume": normalize_volume(safe_int(item.get("volume"))),
             }
         )
     normalized.sort(key=lambda row: row["fecha"])
@@ -381,10 +452,54 @@ def is_expected_market_closure(
     return True
 
 
-def build_daily_rows(symbol: str, asset_id: int, payload: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def deduplicate_payload(payload: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: Dict[datetime, Dict[str, Any]] = {}
+    for item in payload:
+        fecha = item.get("fecha")
+        if isinstance(fecha, datetime):
+            deduped[fecha] = item
+    return [deduped[key] for key in sorted(deduped)]
+
+
+def validate_price_rows(
+    rows: List[Dict[str, Any]],
+    logger: logging.Logger,
+    asset_id: int,
+    interval: str,
+) -> None:
+    if not rows:
+        return
+    zero_volume = sum(1 for row in rows if not row.get("volume"))
+    if zero_volume == len(rows):
+        logger.warning(
+            "All rows for asset_id=%s interval=%s carry empty volume; treating as missing data",
+            asset_id,
+            interval,
+        )
+    flat_candles = sum(
+        1
+        for row in rows
+        if row.get("open") is not None
+        and row.get("open") == row.get("high") == row.get("low") == row.get("close")
+    )
+    if flat_candles:
+        logger.warning(
+            "%s rows for asset_id=%s interval=%s have flat OHLC candles",
+            flat_candles,
+            asset_id,
+            interval,
+        )
+
+
+def build_daily_rows(
+    symbol: str,
+    asset_id: int,
+    payload: List[Dict[str, Any]],
+    include_is_synthetic: bool,
+) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for item in payload:
-        dt = item["fecha"]
+        dt = ensure_utc(item["fecha"])
         rows.append(
             {
                 "symbol": symbol,
@@ -406,13 +521,21 @@ def build_daily_rows(symbol: str, asset_id: int, payload: List[Dict[str, Any]]) 
                 "divadj_close": None,
             }
         )
+        if include_is_synthetic:
+            rows[-1]["is_synthetic"] = asset_id in SYNTHETIC_ASSET_IDS
     return rows
 
 
-def build_intraday_rows(symbol: str, asset_id: int, interval: str, payload: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def build_intraday_rows(
+    symbol: str,
+    asset_id: int,
+    interval: str,
+    payload: List[Dict[str, Any]],
+    include_is_synthetic: bool,
+) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for item in payload:
-        dt = item["fecha"]
+        dt = ensure_utc(item["fecha"])
         epoch = math.floor(dt.timestamp())
         rows.append(
             {
@@ -430,6 +553,8 @@ def build_intraday_rows(symbol: str, asset_id: int, interval: str, payload: List
                 "vwap": None,
             }
         )
+        if include_is_synthetic:
+            rows[-1]["is_synthetic"] = asset_id in SYNTHETIC_ASSET_IDS
     return rows
 
 
@@ -644,15 +769,17 @@ def process_daily(
         logger.info("Daily data for asset_id=%s is up-to-date (latest %s)", asset_id, latest_known)
         return
     payload = fetch_daily_data(symbol, start, end, session, rate_limiter, logger, cache)
+    payload = deduplicate_payload(payload)
     detect_temporal_gaps(payload, 86400, logger, asset_id, "Daily")
     new_payload = filter_new_daily_rows(engine, table, asset_id, payload, logger)
+    validate_price_rows(new_payload, logger, asset_id, "Daily")
     if not new_payload:
         logger.info("No new daily data needed for asset_id=%s", asset_id)
         if payload:
             progress.update(asset_id, "Daily", payload[-1]["fecha"])
         return
-    rows = build_daily_rows(symbol, asset_id, new_payload)
-    upsert_rows(engine, table, rows, ("asset_id", "intervalo", "fecha"), logger)
+    rows = build_daily_rows(symbol, asset_id, new_payload, hasattr(table.c, "is_synthetic"))
+    upsert_rows(engine, table, rows, ("asset_id", "intervalo", "fecha", "symbol"), logger)
     progress.update(asset_id, "Daily", new_payload[-1]["fecha"])
 
 
@@ -680,22 +807,25 @@ def process_intraday(
         logger.info("%s data for asset_id=%s is up-to-date (latest %s)", interval, asset_id, latest_known)
         return
     payload = fetch_intraday_data(symbol, interval, start, end, session, rate_limiter, logger, cache)
+    payload = deduplicate_payload(payload)
     expected_seconds = INTRADAY_SECONDS[interval]
     detect_temporal_gaps(payload, expected_seconds, logger, asset_id, interval)
     new_payload = filter_new_intraday_rows(engine, table, asset_id, interval, payload)
+    validate_price_rows(new_payload, logger, asset_id, interval)
     if not new_payload:
         logger.info("No new %s data needed for asset_id=%s", interval, asset_id)
         if payload:
             progress.update(asset_id, interval, payload[-1]["fecha"])
         return
-    rows = build_intraday_rows(symbol, asset_id, interval, new_payload)
-    upsert_rows(engine, table, rows, ("asset_id", "intervalo", "fecha"), logger)
+    rows = build_intraday_rows(symbol, asset_id, interval, new_payload, hasattr(table.c, "is_synthetic"))
+    upsert_rows(engine, table, rows, ("asset_id", "intervalo", "fecha", "symbol"), logger)
     progress.update(asset_id, interval, new_payload[-1]["fecha"])
 
 
 def main() -> None:
     setup_logging()
     logger = logging.getLogger("fmp_downloader")
+    logger.info("All timestamps are normalised to UTC; epoch values use the same reference")
     try:
         env = load_env(Path(".env"))
         config = build_config(env)
