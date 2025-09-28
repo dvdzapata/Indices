@@ -10,9 +10,11 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote_plus
+from zoneinfo import ZoneInfo
 
 import requests
 from sqlalchemy import MetaData, Table, create_engine, func, select
@@ -42,38 +44,8 @@ DAILY_SECONDS = 86400
 RATE_LIMIT_PER_MINUTE = 2900  # stay below 3000 requests/minute
 BATCH_SIZE = 500
 
-SYNTHETIC_ASSET_IDS = {
-    88,
-    95,
-    96,
-    97,
-    98,
-    99,
-    100,
-    101,
-    102,
-    103,
-    104,
-    105,
-    106,
-    107,
-    108,
-    113,
-    114,
-    115,
-    116,
-    117,
-    118,
-    119,
-    120,
-    121,
-    122,
-    123,
-    124,
-    125,
-    126,
-    140,
-}
+NEW_YORK_TZ = ZoneInfo("America/New_York")
+DECIMAL_QUANTIZER = Decimal("0.000001")
 
 ASSET_SYMBOLS: Tuple[Tuple[int, str], ...] = (
     (88, "^MOVE"),
@@ -267,9 +239,21 @@ def safe_int(value: Any) -> Optional[int]:
 def normalize_volume(value: Optional[int]) -> Optional[int]:
     if value is None:
         return None
-    if value <= 0:
+    if value < 0:
         return None
     return value
+
+
+def to_decimal(value: Optional[float]) -> Optional[Decimal]:
+    if value is None:
+        return None
+    try:
+        decimal_value = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    if not decimal_value.is_finite():
+        return None
+    return decimal_value.quantize(DECIMAL_QUANTIZER, rounding=ROUND_HALF_UP)
 
 
 def ensure_utc(dt: datetime) -> datetime:
@@ -487,20 +471,38 @@ def validate_price_rows(
         oc_max = max(oc_values) if oc_values else None
         oc_min = min(oc_values) if oc_values else None
         has_violation = False
+        reasons: List[str] = []
         if isinstance(high, (int, float)) and oc_max is not None and high < oc_max:
             violations["high_lt_oc"] += 1
             has_violation = True
+            reasons.append("high<max(open,close)")
         if isinstance(low, (int, float)) and oc_min is not None and low > oc_min:
             violations["low_gt_oc"] += 1
             has_violation = True
+            reasons.append("low>min(open,close)")
         if isinstance(high, (int, float)) and isinstance(low, (int, float)) and high < low:
             violations["high_lt_low"] += 1
             has_violation = True
+            reasons.append("high<low")
         if isinstance(volume, (int, float)) and volume < 0:
             violations["volume_negative"] += 1
             has_violation = True
+            reasons.append("volume<0")
         if not has_violation:
             valid_rows.append(row)
+        else:
+            timestamp = row.get("fecha")
+            if isinstance(timestamp, datetime):
+                timestamp_repr = timestamp.isoformat()
+            else:
+                timestamp_repr = str(timestamp)
+            logger.warning(
+                "Discarding row for asset_id=%s interval=%s fecha=%s due to: %s",
+                asset_id,
+                interval,
+                timestamp_repr,
+                ", ".join(reasons) or "validation failure",
+            )
     if len(valid_rows) != original_len:
         logger.warning(
             "Discarded %s/%s rows for asset_id=%s interval=%s due to quality violations "
@@ -542,23 +544,23 @@ def build_daily_rows(
     symbol: str,
     asset_id: int,
     payload: List[Dict[str, Any]],
-    include_is_synthetic: bool,
 ) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for item in payload:
-        dt = ensure_utc(item["fecha"])
+        dt_utc = ensure_utc(item["fecha"])
+        dt_ny = dt_utc.astimezone(NEW_YORK_TZ)
         rows.append(
             {
                 "symbol": symbol,
-                "fecha": dt,
-                "open": item["open"],
-                "high": item["high"],
-                "low": item["low"],
-                "close": item["close"],
+                "fecha": dt_ny,
+                "open": to_decimal(item["open"]),
+                "high": to_decimal(item["high"]),
+                "low": to_decimal(item["low"]),
+                "close": to_decimal(item["close"]),
                 "volume": item["volume"],
-                "change": item["change"],
-                "change_percent": item["change_percent"],
-                "vwap": item["vwap"],
+                "change": to_decimal(item["change"]),
+                "change_percent": to_decimal(item["change_percent"]),
+                "vwap": to_decimal(item["vwap"]),
                 "asset_id": asset_id,
                 "fuente": "FMP",
                 "intervalo": "Daily",
@@ -568,8 +570,6 @@ def build_daily_rows(
                 "divadj_close": None,
             }
         )
-        if include_is_synthetic:
-            rows[-1]["is_synthetic"] = asset_id in SYNTHETIC_ASSET_IDS
     return rows
 
 
@@ -578,20 +578,20 @@ def build_intraday_rows(
     asset_id: int,
     interval: str,
     payload: List[Dict[str, Any]],
-    include_is_synthetic: bool,
 ) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for item in payload:
-        dt = ensure_utc(item["fecha"])
-        epoch = math.floor(dt.timestamp())
+        dt_utc = ensure_utc(item["fecha"])
+        epoch = math.floor(dt_utc.timestamp())
+        dt_ny = dt_utc.astimezone(NEW_YORK_TZ)
         rows.append(
             {
                 "symbol": symbol,
-                "fecha": dt,
-                "open": item["open"],
-                "high": item["high"],
-                "low": item["low"],
-                "close": item["close"],
+                "fecha": dt_ny,
+                "open": to_decimal(item["open"]),
+                "high": to_decimal(item["high"]),
+                "low": to_decimal(item["low"]),
+                "close": to_decimal(item["close"]),
                 "volume": item["volume"],
                 "asset_id": asset_id,
                 "fuente": "FMP",
@@ -600,8 +600,6 @@ def build_intraday_rows(
                 "vwap": None,
             }
         )
-        if include_is_synthetic:
-            rows[-1]["is_synthetic"] = asset_id in SYNTHETIC_ASSET_IDS
     return rows
 
 
@@ -825,8 +823,15 @@ def process_daily(
         if payload:
             progress.update(asset_id, "Daily", payload[-1]["fecha"])
         return
-    rows = build_daily_rows(symbol, asset_id, new_payload, hasattr(table.c, "is_synthetic"))
-    upsert_rows(engine, table, rows, ("asset_id", "intervalo", "fecha", "symbol"), logger)
+    rows = build_daily_rows(symbol, asset_id, new_payload)
+    inserted = upsert_rows(engine, table, rows, ("asset_id", "intervalo", "fecha", "symbol"), logger)
+    if inserted:
+        logger.info(
+            "Confirmed insertion of %s daily rows for asset_id=%s symbol=%s",
+            inserted,
+            asset_id,
+            symbol,
+        )
     progress.update(asset_id, "Daily", new_payload[-1]["fecha"])
 
 
@@ -864,15 +869,26 @@ def process_intraday(
         if payload:
             progress.update(asset_id, interval, payload[-1]["fecha"])
         return
-    rows = build_intraday_rows(symbol, asset_id, interval, new_payload, hasattr(table.c, "is_synthetic"))
-    upsert_rows(engine, table, rows, ("asset_id", "intervalo", "fecha", "symbol"), logger)
+    rows = build_intraday_rows(symbol, asset_id, interval, new_payload)
+    inserted = upsert_rows(engine, table, rows, ("asset_id", "intervalo", "fecha", "symbol"), logger)
+    if inserted:
+        logger.info(
+            "Confirmed insertion of %s %s rows for asset_id=%s symbol=%s",
+            inserted,
+            interval,
+            asset_id,
+            symbol,
+        )
     progress.update(asset_id, interval, new_payload[-1]["fecha"])
 
 
 def main() -> None:
     setup_logging()
     logger = logging.getLogger("fmp_downloader")
-    logger.info("All timestamps are normalised to UTC; epoch values use the same reference")
+    logger.info(
+        "All payload timestamps are normalised to UTC internally; stored fecha uses America/New_York "
+        "timezone while epoch keeps the UTC reference"
+    )
     try:
         env = load_env(Path(".env"))
         config = build_config(env)
