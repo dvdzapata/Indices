@@ -20,7 +20,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 
 BASE_URL = "https://financialmodelingprep.com/stable"
-DAILY_ENDPOINT = BASE_URL + "/historical-price-eod/full/{symbol}"
+DAILY_ENDPOINT = BASE_URL + "/historical-price-eod/full"
 INTRADAY_ENDPOINT = BASE_URL + "/historical-chart/{interval}/{symbol}"
 
 START_DATE = datetime(2019, 1, 1, tzinfo=timezone.utc)
@@ -433,8 +433,9 @@ def fetch_daily_data(
     cache_key = f"{symbol}:{start.date().isoformat()}:{end.date().isoformat()}"
     if cache_key in cache:
         return cache[cache_key]
-    url = DAILY_ENDPOINT.format(symbol=encode_symbol(symbol))
+    url = DAILY_ENDPOINT
     params = {
+        "symbol": symbol,
         "apikey": session.params.get("apikey"),
         "from": start.date().isoformat(),
         "to": end.date().isoformat(),
