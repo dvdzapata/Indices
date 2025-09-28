@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 import requests
 from sqlalchemy import MetaData, Table, create_engine, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import DBAPIError
 
 
 BASE_URL = "https://financialmodelingprep.com/stable"
@@ -608,14 +609,35 @@ def chunked(iterable: List[Dict[str, Any]], size: int) -> Iterable[List[Dict[str
         yield iterable[idx : idx + size]
 
 
-def upsert_rows(engine, table: Table, rows: List[Dict[str, Any]], unique_columns: Tuple[str, ...], logger: logging.Logger) -> int:
+def upsert_rows(
+    engine,
+    table: Table,
+    rows: List[Dict[str, Any]],
+    unique_columns: Tuple[str, ...],
+    logger: logging.Logger,
+) -> int:
     inserted = 0
+    conflict_elements = list(unique_columns)
+    conflict_hint = ", ".join(conflict_elements)
     for batch in chunked(rows, BATCH_SIZE):
-        stmt = pg_insert(table).values(batch)
-        stmt = stmt.on_conflict_do_nothing(index_elements=list(unique_columns))
-        with engine.begin() as connection:
-            result = connection.execute(stmt)
-            inserted += result.rowcount or 0
+        base_stmt = pg_insert(table).values(batch)
+        try:
+            stmt = base_stmt.on_conflict_do_nothing(index_elements=conflict_elements)
+            with engine.begin() as connection:
+                result = connection.execute(stmt)
+        except DBAPIError as exc:
+            original_message = str(getattr(exc, "orig", exc)).lower()
+            if "no unique or exclusion constraint matching the on conflict specification" in original_message:
+                logger.warning(
+                    "Table %s lacks a UNIQUE/PK for (%s); falling back to plain insert",
+                    table.name,
+                    conflict_hint,
+                )
+                with engine.begin() as connection:
+                    result = connection.execute(base_stmt)
+            else:
+                raise
+        inserted += result.rowcount or 0
     if inserted:
         logger.info("Inserted %s rows into %s", inserted, table.name)
     else:
