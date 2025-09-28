@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import quote_plus
+from urllib.parse import quote, quote_plus
 from zoneinfo import ZoneInfo
 
 import requests
@@ -25,7 +25,7 @@ from sqlalchemy.exc import DBAPIError
 BASE_URL = "https://financialmodelingprep.com/stable"
 DAILY_ENDPOINT = BASE_URL + "/historical-price-eod/full"
 DAILY_DIVADJ_ENDPOINT = BASE_URL + "/historical-price-eod/dividend-adjusted"
-INTRADAY_ENDPOINT = BASE_URL + "/historical-chart/{interval}"
+INTRADAY_ENDPOINT = BASE_URL + "/historical-chart/{interval}/{symbol}"
 
 START_DATE = datetime(2019, 1, 1, tzinfo=timezone.utc)
 PROGRESS_FILE = Path("fmp_progress.json")
@@ -923,12 +923,18 @@ def fetch_intraday_data(
     cache_key = f"{symbol}:{start.isoformat()}:{end.isoformat()}"
     if cache_key in interval_cache:
         return interval_cache[cache_key]
-    url = INTRADAY_ENDPOINT.format(interval=interval)
+    encoded_symbol = quote(symbol, safe="")
+    url = INTRADAY_ENDPOINT.format(interval=interval, symbol=encoded_symbol)
+    interval_seconds = INTRADAY_SECONDS[interval]
+    expected_rows = max(
+        100,
+        math.ceil(max((end - start).total_seconds(), 0) / interval_seconds) + 10,
+    )
     params = {
         "apikey": session.params.get("apikey"),
-        "symbol": symbol,
         "from": start.strftime("%Y-%m-%d %H:%M:%S"),
         "to": end.strftime("%Y-%m-%d %H:%M:%S"),
+        "timeseries": expected_rows,
     }
     payload = request_json(session, url, params=params, rate_limiter=rate_limiter, logger=logger)
     normalized = normalize_intraday_payload(payload)
