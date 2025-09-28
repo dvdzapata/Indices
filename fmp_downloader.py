@@ -17,7 +17,7 @@ from urllib.parse import quote_plus
 from zoneinfo import ZoneInfo
 
 import requests
-from sqlalchemy import MetaData, Table, create_engine, func, select
+from sqlalchemy import MetaData, Table, create_engine, func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import DBAPIError
 
@@ -86,6 +86,20 @@ class Config:
     db_url: str
 
 
+@dataclass
+class SymbolStats:
+    received: int = 0
+    inserted: int = 0
+    discarded: int = 0
+    gaps: int = 0
+
+    def accumulate(self, other: "SymbolStats") -> None:
+        self.received += other.received
+        self.inserted += other.inserted
+        self.discarded += other.discarded
+        self.gaps += other.gaps
+
+
 class RateLimiter:
     """Simple rolling-window rate limiter."""
 
@@ -111,6 +125,9 @@ class ProgressTracker:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.state: Dict[str, Dict[str, str]] = {}
+        self._dirty = False
+        self._pending_writes = 0
+        self._write_threshold = 100
         if path.exists():
             try:
                 self.state = json.loads(path.read_text(encoding="utf-8"))
@@ -138,10 +155,25 @@ class ProgressTracker:
         if asset_key not in self.state:
             self.state[asset_key] = {}
         self.state[asset_key][interval] = timestamp.astimezone(timezone.utc).isoformat()
+        self._dirty = True
+        self._pending_writes += 1
+        if self._pending_writes >= self._write_threshold:
+            self.flush()
+
+    def flush(self, force: bool = False) -> None:
+        if not self._dirty:
+            return
+        if not force and self._pending_writes < self._write_threshold:
+            return
         try:
-            self.path.write_text(json.dumps(self.state, indent=2, sort_keys=True), encoding="utf-8")
+            self.path.write_text(
+                json.dumps(self.state, indent=2, sort_keys=True), encoding="utf-8"
+            )
         except OSError as exc:
             logging.getLogger(__name__).warning("Failed to persist progress tracker: %s", exc)
+            return
+        self._dirty = False
+        self._pending_writes = 0
 
 
 def load_env(path: Path) -> Dict[str, str]:
@@ -377,9 +409,10 @@ def detect_temporal_gaps(
     logger: logging.Logger,
     asset_id: int,
     interval: str,
-) -> None:
+) -> int:
     previous: Optional[datetime] = None
-    tolerated = expected_seconds * 3
+    tolerated = expected_seconds * 1.5
+    gap_count = 0
     for row in rows:
         current = row.get("fecha")
         if not isinstance(current, datetime):
@@ -397,7 +430,9 @@ def detect_temporal_gaps(
                     current.isoformat(),
                     delta,
                 )
+                gap_count += 1
         previous = current
+    return gap_count
 
 
 def is_expected_market_closure(
@@ -411,13 +446,14 @@ def is_expected_market_closure(
     if interval not in INTRADAY_SECONDS:
         return False
 
-    # Anything within the default tolerance is already considered fine.
     delta_seconds = (current - previous).total_seconds()
-    if delta_seconds <= expected_seconds * 3:
-        return True
+    if delta_seconds <= expected_seconds:
+        return False
 
-    prev_date = previous.date()
-    curr_date = current.date()
+    previous_ny = previous.astimezone(NEW_YORK_TZ)
+    current_ny = current.astimezone(NEW_YORK_TZ)
+    prev_date = previous_ny.date()
+    curr_date = current_ny.date()
     if curr_date <= prev_date:
         return False
 
@@ -451,9 +487,9 @@ def validate_price_rows(
     logger: logging.Logger,
     asset_id: int,
     interval: str,
-) -> None:
+) -> int:
     if not rows:
-        return
+        return 0
     original_len = len(rows)
     violations = {
         "high_lt_oc": 0,
@@ -540,6 +576,7 @@ def validate_price_rows(
             interval,
         )
 
+    return original_len - len(rows)
 
 def build_daily_rows(
     symbol: str,
@@ -549,11 +586,10 @@ def build_daily_rows(
     rows: List[Dict[str, Any]] = []
     for item in payload:
         dt_utc = ensure_utc(item["fecha"])
-        dt_ny = dt_utc.astimezone(NEW_YORK_TZ)
         rows.append(
             {
                 "symbol": symbol,
-                "fecha": dt_ny,
+                "fecha": dt_utc,
                 "open": to_decimal(item["open"]),
                 "high": to_decimal(item["high"]),
                 "low": to_decimal(item["low"]),
@@ -584,11 +620,10 @@ def build_intraday_rows(
     for item in payload:
         dt_utc = ensure_utc(item["fecha"])
         epoch = math.floor(dt_utc.timestamp())
-        dt_ny = dt_utc.astimezone(NEW_YORK_TZ)
         rows.append(
             {
                 "symbol": symbol,
-                "fecha": dt_ny,
+                "fecha": dt_utc,
                 "open": to_decimal(item["open"]),
                 "high": to_decimal(item["high"]),
                 "low": to_decimal(item["low"]),
@@ -614,34 +649,36 @@ def upsert_rows(
     table: Table,
     rows: List[Dict[str, Any]],
     unique_columns: Tuple[str, ...],
+    update_columns: Tuple[str, ...],
     logger: logging.Logger,
 ) -> int:
+    if not rows:
+        return 0
     inserted = 0
     conflict_elements = list(unique_columns)
-    conflict_hint = ", ".join(conflict_elements)
     for batch in chunked(rows, BATCH_SIZE):
         base_stmt = pg_insert(table).values(batch)
+        update_mapping = {col: getattr(base_stmt.excluded, col) for col in update_columns}
+        stmt = base_stmt.on_conflict_do_update(
+            index_elements=conflict_elements,
+            set_=update_mapping,
+        )
         try:
-            stmt = base_stmt.on_conflict_do_nothing(index_elements=conflict_elements)
             with engine.begin() as connection:
                 result = connection.execute(stmt)
         except DBAPIError as exc:
-            original_message = str(getattr(exc, "orig", exc)).lower()
-            if "no unique or exclusion constraint matching the on conflict specification" in original_message:
-                logger.warning(
-                    "Table %s lacks a UNIQUE/PK for (%s); falling back to plain insert",
-                    table.name,
-                    conflict_hint,
-                )
-                with engine.begin() as connection:
-                    result = connection.execute(base_stmt)
-            else:
-                raise
+            logger.error(
+                "Failed to upsert batch into %s on columns (%s): %s",
+                table.name,
+                ", ".join(conflict_elements),
+                exc,
+            )
+            raise
         inserted += result.rowcount or 0
     if inserted:
-        logger.info("Inserted %s rows into %s", inserted, table.name)
+        logger.info("Upserted %s rows into %s", inserted, table.name)
     else:
-        logger.info("No new rows to insert into %s", table.name)
+        logger.info("No new rows to upsert into %s", table.name)
     return inserted
 
 
@@ -731,6 +768,28 @@ def ensure_intraday_tables(engine, table: Table, asset_id: int, interval: str, l
         total = connection.execute(query).scalar_one()
     if total == 0:
         logger.info("No intraday data yet for asset_id=%s interval=%s", asset_id, interval)
+
+
+def ensure_unique_indexes(engine, logger: logging.Logger) -> None:
+    statements = [
+        (
+            "cotizaciones_diarias",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_cotizaciones_diarias_asset_interval_fecha_symbol "
+            "ON cotizaciones_diarias (asset_id, intervalo, fecha, symbol)",
+        ),
+        (
+            "cotizaciones_intradia",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_cotizaciones_intradia_asset_interval_fecha_symbol "
+            "ON cotizaciones_intradia (asset_id, intervalo, fecha, symbol)",
+        ),
+    ]
+    with engine.begin() as connection:
+        for table_name, statement in statements:
+            try:
+                connection.execute(text(statement))
+                logger.debug("Ensured unique index for %s", table_name)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning("Failed to ensure unique index on %s: %s", table_name, exc)
 
 
 def get_last_timestamp(engine, table: Table, asset_id: int, interval: str) -> Optional[datetime]:
@@ -828,25 +887,49 @@ def process_daily(
     table: Table,
     progress: ProgressTracker,
     logger: logging.Logger,
-) -> None:
+) -> SymbolStats:
     last_progress = progress.get(asset_id, "Daily")
     last_db = get_last_timestamp(engine, table, asset_id, "Daily")
     start, end, latest_known = _compute_fetch_window(last_progress, last_db, DAILY_SECONDS, buffer_intervals=3)
     if latest_known and (datetime.now(timezone.utc) - latest_known) < timedelta(hours=12):
         logger.info("Daily data for asset_id=%s is up-to-date (latest %s)", asset_id, latest_known)
-        return
+        return SymbolStats()
     payload = fetch_daily_data(symbol, start, end, session, rate_limiter, logger, cache)
+    received = len(payload)
     payload = deduplicate_payload(payload)
-    detect_temporal_gaps(payload, 86400, logger, asset_id, "Daily")
+    dedup_discarded = received - len(payload)
+    gap_count = detect_temporal_gaps(payload, 86400, logger, asset_id, "Daily")
     new_payload = filter_new_daily_rows(engine, table, asset_id, payload, logger)
-    validate_price_rows(new_payload, logger, asset_id, "Daily")
+    filtered_out = len(payload) - len(new_payload)
+    discarded_by_validation = validate_price_rows(new_payload, logger, asset_id, "Daily")
+    total_discarded = dedup_discarded + filtered_out + discarded_by_validation
     if not new_payload:
         logger.info("No new daily data needed for asset_id=%s", asset_id)
         if payload:
             progress.update(asset_id, "Daily", payload[-1]["fecha"])
-        return
+        return SymbolStats(received=received, discarded=total_discarded, gaps=gap_count)
     rows = build_daily_rows(symbol, asset_id, new_payload)
-    inserted = upsert_rows(engine, table, rows, ("asset_id", "intervalo", "fecha", "symbol"), logger)
+    inserted = upsert_rows(
+        engine,
+        table,
+        rows,
+        ("asset_id", "intervalo", "fecha", "symbol"),
+        (
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "change",
+            "change_percent",
+            "vwap",
+            "divadj_open",
+            "divadj_high",
+            "divadj_low",
+            "divadj_close",
+        ),
+        logger,
+    )
     if inserted:
         logger.info(
             "Confirmed insertion of %s daily rows for asset_id=%s symbol=%s",
@@ -855,6 +938,12 @@ def process_daily(
             symbol,
         )
     progress.update(asset_id, "Daily", new_payload[-1]["fecha"])
+    return SymbolStats(
+        received=received,
+        inserted=inserted,
+        discarded=total_discarded,
+        gaps=gap_count,
+    )
 
 
 def process_intraday(
@@ -868,7 +957,7 @@ def process_intraday(
     table: Table,
     progress: ProgressTracker,
     logger: logging.Logger,
-) -> None:
+) -> SymbolStats:
     last_progress = progress.get(asset_id, interval)
     last_db = get_last_timestamp(engine, table, asset_id, interval)
     start, end, latest_known = _compute_fetch_window(
@@ -879,20 +968,31 @@ def process_intraday(
     )
     if latest_known and (datetime.now(timezone.utc) - latest_known) < timedelta(minutes=5):
         logger.info("%s data for asset_id=%s is up-to-date (latest %s)", interval, asset_id, latest_known)
-        return
+        return SymbolStats()
     payload = fetch_intraday_data(symbol, interval, start, end, session, rate_limiter, logger, cache)
+    received = len(payload)
     payload = deduplicate_payload(payload)
     expected_seconds = INTRADAY_SECONDS[interval]
-    detect_temporal_gaps(payload, expected_seconds, logger, asset_id, interval)
+    dedup_discarded = received - len(payload)
+    gap_count = detect_temporal_gaps(payload, expected_seconds, logger, asset_id, interval)
     new_payload = filter_new_intraday_rows(engine, table, asset_id, interval, payload)
-    validate_price_rows(new_payload, logger, asset_id, interval)
+    filtered_out = len(payload) - len(new_payload)
+    discarded_by_validation = validate_price_rows(new_payload, logger, asset_id, interval)
+    total_discarded = dedup_discarded + filtered_out + discarded_by_validation
     if not new_payload:
         logger.info("No new %s data needed for asset_id=%s", interval, asset_id)
         if payload:
             progress.update(asset_id, interval, payload[-1]["fecha"])
-        return
+        return SymbolStats(received=received, discarded=total_discarded, gaps=gap_count)
     rows = build_intraday_rows(symbol, asset_id, interval, new_payload)
-    inserted = upsert_rows(engine, table, rows, ("asset_id", "intervalo", "fecha", "symbol"), logger)
+    inserted = upsert_rows(
+        engine,
+        table,
+        rows,
+        ("asset_id", "intervalo", "fecha", "symbol"),
+        ("open", "high", "low", "close", "volume", "epoch", "vwap"),
+        logger,
+    )
     if inserted:
         logger.info(
             "Confirmed insertion of %s %s rows for asset_id=%s symbol=%s",
@@ -902,14 +1002,20 @@ def process_intraday(
             symbol,
         )
     progress.update(asset_id, interval, new_payload[-1]["fecha"])
+    return SymbolStats(
+        received=received,
+        inserted=inserted,
+        discarded=total_discarded,
+        gaps=gap_count,
+    )
 
 
 def main() -> None:
     setup_logging()
     logger = logging.getLogger("fmp_downloader")
     logger.info(
-        "All payload timestamps are normalised to UTC internally; stored fecha uses America/New_York "
-        "timezone while epoch keeps the UTC reference"
+        "All payload timestamps are normalised to UTC and stored as UTC; convert in downstream clients "
+        "if a different timezone is required"
     )
     try:
         env = load_env(Path(".env"))
@@ -927,6 +1033,8 @@ def main() -> None:
         logger.error("Failed to reflect database tables: %s", exc)
         sys.exit(1)
 
+    ensure_unique_indexes(engine, logger)
+
     progress = ProgressTracker(PROGRESS_FILE)
     rate_limiter = RateLimiter(RATE_LIMIT_PER_MINUTE, 60)
     session = requests.Session()
@@ -937,9 +1045,10 @@ def main() -> None:
 
     for asset_id, symbol in ASSET_SYMBOLS:
         logger.info("Processing symbol=%s asset_id=%s", symbol, asset_id)
+        symbol_stats = SymbolStats()
         try:
             ensure_daily_coverage(engine, daily_table, asset_id, logger)
-            process_daily(
+            daily_stats = process_daily(
                 symbol,
                 asset_id,
                 session,
@@ -950,9 +1059,10 @@ def main() -> None:
                 progress,
                 logger,
             )
+            symbol_stats.accumulate(daily_stats)
             for interval in INTRADAY_INTERVALS:
                 ensure_intraday_tables(engine, intraday_table, asset_id, interval, logger)
-                process_intraday(
+                intraday_stats = process_intraday(
                     symbol,
                     asset_id,
                     interval,
@@ -964,11 +1074,23 @@ def main() -> None:
                     progress,
                     logger,
                 )
+                symbol_stats.accumulate(intraday_stats)
         except Exception as exc:  # pylint: disable=broad-except
             logger.exception("Error processing symbol %s (asset_id=%s): %s", symbol, asset_id, exc)
-            continue
+        finally:
+            logger.info(
+                "Resumen %s (asset_id=%s): recibidas=%s, upsertadas=%s, descartadas=%s, gaps=%s",
+                symbol,
+                asset_id,
+                symbol_stats.received,
+                symbol_stats.inserted,
+                symbol_stats.discarded,
+                symbol_stats.gaps,
+            )
+            progress.flush(force=True)
 
     logger.info("Data synchronization completed")
+    progress.flush(force=True)
 
 
 if __name__ == "__main__":
